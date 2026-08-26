@@ -1,0 +1,12 @@
+
+flowchart TD
+    A["Input video: MP4"] --> B["FFmpeg"]
+    B --> C["DASH package"]
+    C --> D["manifest.mpd"]
+    C --> E["Video and audio segments"]
+    D --> F["FastAPI media endpoint"]
+    E --> F
+    F --> G["dash.js in browser"]
+    G --> H["Built-in ABR"]
+    H --> I["HTML video element"]
+    I --> J["User watches video"]
