@@ -8,14 +8,16 @@ interface DashPlayerProps {
   onBack?: () => void;
 }
 
+type VideoElementWithWebkitMetrics = HTMLVideoElement & {
+  webkitDroppedFrameCount?: number;
+};
+
 export default function DashPlayer({ videoId, onBack }: DashPlayerProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const playerRef = useRef<dashjs.MediaPlayerClass | null>(null);
   const lastSegmentTimeRef = useRef<number | null>(null);
   const lastMeasuredThroughputRef = useRef<number>(0);
 
-  const [currentVideoId, setCurrentVideoId] = useState(videoId);
-  const [videoList, setVideoList] = useState<string[]>([]);
   const [videoTitle, setVideoTitle] = useState("Loading Video...");
   const [qualityLevels, setQualityLevels] = useState<QualityLevel[]>([]);
   const [selectedQualityId, setSelectedQualityId] = useState<string>("auto");
@@ -32,20 +34,6 @@ export default function DashPlayer({ videoId, onBack }: DashPlayerProps) {
     segmentFetch: "No requests yet",
   });
 
-  // Fetch all available video IDs from FastAPI
-  useEffect(() => {
-    fetch("/api/videos")
-      .then((res) => res.json())
-      .then((data) => {
-        if (Array.isArray(data)) setVideoList(data);
-      })
-      .catch((err) => console.warn("Could not load /api/videos:", err));
-  }, []);
-
-  useEffect(() => {
-    setCurrentVideoId(videoId);
-  }, [videoId]);
-
   useEffect(() => {
     let isMounted = true;
     let player: dashjs.MediaPlayerClass | null = null;
@@ -55,10 +43,8 @@ export default function DashPlayer({ videoId, onBack }: DashPlayerProps) {
       const video = videoRef.current;
       if (!video) return;
 
-      let streamUrl = "";
-
       try {
-        const res = await fetch(`/api/video/${currentVideoId}`);
+        const res = await fetch(`/api/video/${videoId}`);
         if (!res.ok) {
           throw new Error(`Failed to fetch video: ${res.status} ${res.statusText}`);
         }
@@ -66,58 +52,49 @@ export default function DashPlayer({ videoId, onBack }: DashPlayerProps) {
         if (isMounted) {
           if (data.title) setVideoTitle(data.title);
         }
-        streamUrl = data.manifestUrl;
-      } catch (err) {
-        console.error("Failed to fetch video from FastAPI server:", err);
-        return;
-      }
 
-      if (!isMounted || !videoRef.current) return;
+        if (!isMounted || !videoRef.current) return;
 
-      player = dashjs.MediaPlayer().create();
-      playerRef.current = player;
+        player = dashjs.MediaPlayer().create();
+        playerRef.current = player;
 
-      const populateQualityLevels = () => {
-        if (!player) return;
-        try {
-          const reps = player.getRepresentationsByType("video") || [];
-          if (reps.length > 0) {
-            const levels: QualityLevel[] = reps.map((rep) => {
-              const kbps = rep.bitrateInKbit ?? (rep.bandwidth ? Math.round(rep.bandwidth / 1000) : 0);
-              return {
-                id: rep.id,
-                bitrate: kbps,
-                width: rep.width,
-                height: rep.height,
-                label: rep.height
-                  ? `${rep.height}p`
-                  : kbps >= 1000
-                    ? `${(kbps / 1000).toFixed(1)} Mbps`
-                    : `${kbps} kbps`,
-              };
-            });
-            setQualityLevels(levels);
+        const streamUrl = data.manifestUrl;
+        const populateQualityLevels = () => {
+          if (!player) return;
+          try {
+            const reps = player.getRepresentationsByType("video") || [];
+            if (reps.length > 0) {
+              const levels: QualityLevel[] = reps.map((rep) => {
+                const kbps = rep.bitrateInKbit ?? (rep.bandwidth ? Math.round(rep.bandwidth / 1000) : 0);
+                return {
+                  id: rep.id,
+                  bitrate: kbps,
+                  width: rep.width,
+                  height: rep.height,
+                  label: rep.height
+                    ? `${rep.height}p`
+                    : kbps >= 1000
+                      ? `${(kbps / 1000).toFixed(1)} Mbps`
+                      : `${kbps} kbps`,
+                };
+              });
+              setQualityLevels(levels);
+            }
+          } catch (e) {
+            console.warn("Could not retrieve representations:", e);
           }
-        } catch (e) {
-          console.warn("Could not retrieve representations:", e);
-        }
-      };
+        };
 
-      // Populate quality levels when stream initializes
-      player.on(dashjs.MediaPlayer.events.STREAM_INITIALIZED, populateQualityLevels);
-      player.on(dashjs.MediaPlayer.events.MANIFEST_LOADED, populateQualityLevels);
+        // Populate quality levels when stream initializes
+        player.on(dashjs.MediaPlayer.events.STREAM_INITIALIZED, populateQualityLevels);
+        player.on(dashjs.MediaPlayer.events.MANIFEST_LOADED, populateQualityLevels);
 
-      // Track chunk fetch completions and calculate throughput
-      player.on(dashjs.MediaPlayer.events.FRAGMENT_LOADING_COMPLETED, (e: any) => {
-        lastSegmentTimeRef.current = Date.now();
-        if (e?.request) {
+        // Track chunk fetch completions and calculate throughput
+        player.on(dashjs.MediaPlayer.events.FRAGMENT_LOADING_COMPLETED, (e: dashjs.FragmentLoadingCompletedEvent) => {
+          lastSegmentTimeRef.current = Date.now();
           const bytes = e.request.bytesLoaded || e.request.bytesTotal || 0;
-          const startTime = e.request.startDate
-            ? new Date(e.request.startDate).getTime()
-            : 0;
-          const endTime = e.request.requestEndDate
-            ? new Date(e.request.requestEndDate).getTime()
-            : Date.now();
+          const startTime = e.request.startDate.getTime();
+          const endTime = e.request.requestEndDate?.getTime() ?? Date.now();
           if (bytes > 0 && startTime > 0 && endTime > startTime) {
             const durationSec = (endTime - startTime) / 1000;
             const kbps = (bytes * 8) / 1000 / durationSec;
@@ -125,146 +102,151 @@ export default function DashPlayer({ videoId, onBack }: DashPlayerProps) {
               lastMeasuredThroughputRef.current = kbps;
             }
           }
-        }
-      });
-
-      // Track active playback quality changes
-      player.on(dashjs.MediaPlayer.events.QUALITY_CHANGE_RENDERED, (e: any) => {
-        if (e.mediaType === "video" && e.newRepresentation) {
-          const rep = e.newRepresentation;
-          const label = rep.height
-            ? `${rep.height}p`
-            : rep.bitrateInKbit
-              ? `${Math.round(rep.bitrateInKbit)} kbps`
-              : "";
-          if (label) setCurrentPlayingQuality(label);
-        }
-      });
-
-      player.initialize(videoRef.current, streamUrl, true);
-
-      // Poll live metrics every 500ms
-      interval = window.setInterval(() => {
-        const video = videoRef.current;
-        if (!player || !video) return;
-
-        let activeRep: dashjs.Representation | null = null;
-        try {
-          activeRep = player.getCurrentRepresentationForType("video");
-        } catch {
-          // Stream not ready yet
-        }
-
-        if (activeRep) {
-          const activeLabel = activeRep.height
-            ? `${activeRep.height}p`
-            : activeRep.bitrateInKbit
-              ? `${Math.round(activeRep.bitrateInKbit)} kbps`
-              : "";
-          if (activeLabel) setCurrentPlayingQuality(activeLabel);
-        }
-
-        // 1. Quality Mode
-        let isAuto = true;
-        try {
-          const settings = player.getSettings();
-          isAuto = settings.streaming?.abr?.autoSwitchBitrate?.video ?? true;
-        } catch {
-          // Ignore
-        }
-        const qualityMode = isAuto ? "Auto" : "Manual";
-
-        // 2. Resolution
-        let resolution = "0 x 0";
-        if (activeRep?.width && activeRep?.height) {
-          resolution = `${activeRep.width} x ${activeRep.height}`;
-        } else if (video.videoWidth > 0 && video.videoHeight > 0) {
-          resolution = `${video.videoWidth} x ${video.videoHeight}`;
-        }
-
-        // 3. Quality
-        let quality = "0p";
-        if (activeRep?.height) {
-          quality = `${activeRep.height}p`;
-        }
-
-        // 4. Encoded Video Bitrate
-        let bitrate = "0.00 Mbps";
-        if (activeRep) {
-          const kbps = activeRep.bitrateInKbit ?? (activeRep.bandwidth ? activeRep.bandwidth / 1000 : 0);
-          if (kbps >= 1000) {
-            bitrate = `${(kbps / 1000).toFixed(2)} Mbps`;
-          } else if (kbps > 0) {
-            bitrate = `${Math.round(kbps)} kbps`;
-          }
-        }
-
-        // 5. Realtime Throughput
-        let throughputKbps = 0;
-        try {
-          throughputKbps = player.getAverageThroughput("video") || 0;
-        } catch {
-          // Ignore if unready
-        }
-
-        if (!Number.isFinite(throughputKbps) || throughputKbps <= 0) {
-          throughputKbps = lastMeasuredThroughputRef.current;
-        } else {
-          lastMeasuredThroughputRef.current = throughputKbps;
-        }
-
-        let throughput = "Measuring...";
-        if (throughputKbps > 0) {
-          if (throughputKbps >= 1000) {
-            throughput = `${(throughputKbps / 1000).toFixed(2)} Mbps`;
-          } else {
-            throughput = `${Math.round(throughputKbps)} kbps`;
-          }
-        }
-
-        // 6. Buffer Ahead
-        let bufferLen = 0;
-        try {
-          bufferLen = player.getBufferLength("video") || 0;
-        } catch {
-          // Ignore
-        }
-        const bufferAhead = Number.isFinite(bufferLen)
-          ? `${Math.max(0, bufferLen).toFixed(1)}s`
-          : "0.0s";
-
-        // 7. Dropped Frames
-        let droppedFrames = "0 / 0 frames";
-        if (typeof video.getVideoPlaybackQuality === "function") {
-          const q = video.getVideoPlaybackQuality();
-          droppedFrames = `${q.droppedVideoFrames} / ${q.totalVideoFrames} frames`;
-        } else if ((video as any).webkitDroppedFrameCount !== undefined) {
-          droppedFrames = `${(video as any).webkitDroppedFrameCount} dropped`;
-        }
-
-        // 8. Segment Fetch Delta
-        let segmentFetch = "No requests yet";
-        if (lastSegmentTimeRef.current !== null) {
-          const secAgo = Math.floor((Date.now() - lastSegmentTimeRef.current) / 1000);
-          segmentFetch = secAgo < 3
-            ? "Just now"
-            : secAgo < 60
-              ? `${secAgo}s ago`
-              : `${Math.floor(secAgo / 60)}m ${secAgo % 60}s ago`;
-        }
-
-
-        setStats({
-          qualityMode,
-          resolution,
-          quality,
-          bitrate,
-          throughput,
-          bufferAhead,
-          droppedFrames,
-          segmentFetch,
         });
-      }, 500);
+
+        // Track active playback quality changes
+        player.on(dashjs.MediaPlayer.events.QUALITY_CHANGE_RENDERED, (e: dashjs.QualityChangeRenderedEvent) => {
+          if (e.mediaType === "video" && e.newRepresentation) {
+            const rep = e.newRepresentation;
+            const label = rep.height
+              ? `${rep.height}p`
+              : rep.bitrateInKbit
+                ? `${Math.round(rep.bitrateInKbit)} kbps`
+                : "";
+            if (label) setCurrentPlayingQuality(label);
+          }
+        });
+
+        player.initialize(videoRef.current, streamUrl, true);
+
+        // Poll live metrics every 500ms
+        interval = window.setInterval(() => {
+          const video = videoRef.current;
+          if (!player || !video) return;
+
+          let activeRep: dashjs.Representation | null = null;
+          try {
+            activeRep = player.getCurrentRepresentationForType("video");
+          } catch {
+            // Stream not ready yet
+          }
+
+          if (activeRep) {
+            const activeLabel = activeRep.height
+              ? `${activeRep.height}p`
+              : activeRep.bitrateInKbit
+                ? `${Math.round(activeRep.bitrateInKbit)} kbps`
+                : "";
+            if (activeLabel) setCurrentPlayingQuality(activeLabel);
+          }
+
+          // 1. Quality Mode
+          let isAuto = true;
+          try {
+            const settings = player.getSettings();
+            isAuto = settings.streaming?.abr?.autoSwitchBitrate?.video ?? true;
+          } catch {
+            // Ignore
+          }
+          const qualityMode = isAuto ? "Auto" : "Manual";
+
+          // 2. Resolution
+          let resolution = "0 x 0";
+          if (activeRep?.width && activeRep?.height) {
+            resolution = `${activeRep.width} x ${activeRep.height}`;
+          } else if (video.videoWidth > 0 && video.videoHeight > 0) {
+            resolution = `${video.videoWidth} x ${video.videoHeight}`;
+          }
+
+          // 3. Quality
+          let quality = "0p";
+          if (activeRep?.height) {
+            quality = `${activeRep.height}p`;
+          }
+
+          // 4. Encoded Video Bitrate
+          let bitrate = "0.00 Mbps";
+          if (activeRep) {
+            const kbps = activeRep.bitrateInKbit ?? (activeRep.bandwidth ? activeRep.bandwidth / 1000 : 0);
+            if (kbps >= 1000) {
+              bitrate = `${(kbps / 1000).toFixed(2)} Mbps`;
+            } else if (kbps > 0) {
+              bitrate = `${Math.round(kbps)} kbps`;
+            }
+          }
+
+          // 5. Realtime Throughput
+          let throughputKbps = 0;
+          try {
+            throughputKbps = player.getAverageThroughput("video") || 0;
+          } catch {
+            // Ignore if unready
+          }
+
+          if (!Number.isFinite(throughputKbps) || throughputKbps <= 0) {
+            throughputKbps = lastMeasuredThroughputRef.current;
+          } else {
+            lastMeasuredThroughputRef.current = throughputKbps;
+          }
+
+          let throughput = "Measuring...";
+          if (throughputKbps > 0) {
+            if (throughputKbps >= 1000) {
+              throughput = `${(throughputKbps / 1000).toFixed(2)} Mbps`;
+            } else {
+              throughput = `${Math.round(throughputKbps)} kbps`;
+            }
+          }
+
+          // 6. Buffer Ahead
+          let bufferLen = 0;
+          try {
+            bufferLen = player.getBufferLength("video") || 0;
+          } catch {
+            // Ignore
+          }
+          const bufferAhead = Number.isFinite(bufferLen)
+            ? `${Math.max(0, bufferLen).toFixed(1)}s`
+            : "0.0s";
+
+          // 7. Dropped Frames
+          let droppedFrames = "0 / 0 frames";
+          if (typeof video.getVideoPlaybackQuality === "function") {
+            const q = video.getVideoPlaybackQuality();
+            droppedFrames = `${q.droppedVideoFrames} / ${q.totalVideoFrames} frames`;
+          } else {
+            const videoWithWebkitMetrics = video as VideoElementWithWebkitMetrics;
+            if (videoWithWebkitMetrics.webkitDroppedFrameCount !== undefined) {
+              droppedFrames = `${videoWithWebkitMetrics.webkitDroppedFrameCount} dropped`;
+            }
+          }
+
+          // 8. Segment Fetch Delta
+          let segmentFetch = "No requests yet";
+          if (lastSegmentTimeRef.current !== null) {
+            const secAgo = Math.floor((Date.now() - lastSegmentTimeRef.current) / 1000);
+            segmentFetch = secAgo < 3
+              ? "Just now"
+              : secAgo < 60
+                ? `${secAgo}s ago`
+                : `${Math.floor(secAgo / 60)}m ${secAgo % 60}s ago`;
+          }
+
+          setStats({
+            qualityMode,
+            resolution,
+            quality,
+            bitrate,
+            throughput,
+            bufferAhead,
+            droppedFrames,
+            segmentFetch,
+          });
+        }, 500);
+      } catch (err) {
+        console.error("Failed to fetch video from FastAPI server:", err);
+        return;
+      }
     };
 
     initStream();
@@ -277,7 +259,7 @@ export default function DashPlayer({ videoId, onBack }: DashPlayerProps) {
         playerRef.current = null;
       }
     };
-  }, [currentVideoId]);
+  }, [videoId]);
 
   const handleQualitySelect = (repId: string) => {
     setSelectedQualityId(repId);
